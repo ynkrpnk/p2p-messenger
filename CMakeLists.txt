@@ -7,4 +7,4 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_compile_options(-Wall -Wextra)
 
-add_executable(p2pd src/main.cpp)
+add_executable(p2pd src/main.cpp src/protocol/packet.cpp)
