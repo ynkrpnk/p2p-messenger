@@ -1,4 +1,5 @@
 #include "protocol/packet.h"
+#include "storage/storage.h"
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <ctime>
 #include <map>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -57,6 +59,7 @@ static int g_port = 0;
 static int g_udp_fd = -1;
 static std::map<int, Peer> g_peers;
 static std::map<std::string, Known> g_known;
+static std::unique_ptr<Storage> g_db;  // локальна база історії
 
 // ---------- Допоміжні функції ----------
 static void die(const char* msg) {
@@ -198,12 +201,14 @@ static void handle_packet(int fd, Peer& p, const Packet& pk) {
                 p.name = pk.body.substr(bar + 1);
             }
             printf("[*] представився: %s\n", p.name.c_str());
+            g_db->touch_peer(p.id, p.name);
             break;
         }
         case PacketType::Text: {
             std::string t = pk.body;
             trim_eol(t);
             printf("[%s] %s\n", label(p, fd).c_str(), t.c_str());
+            g_db->save_message(p.id, false, t);
             break;
         }
         case PacketType::Ping:
@@ -368,6 +373,35 @@ static void print_peers() {
                is_known_peer(id) ? "[з'єднано]" : "");
 }
 
+static std::string fmt_time(time_t t) {
+    char buf[32];
+    tm lt;
+    localtime_r(&t, &lt);
+    strftime(buf, sizeof(buf), "%d.%m %H:%M", &lt);
+    return buf;
+}
+
+// /history без аргументу — список переписок; /history <частина імені> — остання історія
+static void print_history(const std::string& query) {
+    auto peers = g_db->peers();
+    if (query.empty()) {
+        printf("--- Переписки (%s) ---\n", g_db->path().c_str());
+        for (auto& p : peers)
+            printf("  %s  [%d повідомлень, востаннє %s]\n", p.name.c_str(), p.messages,
+                   fmt_time(p.last_seen).c_str());
+        if (peers.empty()) printf("  (порожньо)\n");
+        return;
+    }
+    for (auto& p : peers) {
+        if (p.name.find(query) == std::string::npos) continue;
+        printf("--- Історія з %s ---\n", p.name.c_str());
+        for (auto& m : g_db->history(p.id, 20))
+            printf("  %s  %s: %s\n", fmt_time(m.ts).c_str(), m.outgoing ? "я" : p.name.c_str(), m.body.c_str());
+        return;
+    }
+    printf("[!] переписку з '%s' не знайдено\n", query.c_str());
+}
+
 static void on_stdin() {
     char buf[1024];
     ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
@@ -388,11 +422,22 @@ static void on_stdin() {
             g_running = false;
         } else if (line == "/peers") {
             print_peers();
+        } else if (line.rfind("/history", 0) == 0) {
+            print_history(line.size() > 9 ? line.substr(9) : "");
         } else {
             std::vector<int> dead;
-            for (auto& [fd, p] : g_peers)
-                if (!p.connecting && !send_packet(fd, p, PacketType::Text, line)) dead.push_back(fd);
+            int sent = 0;
+            for (auto& [fd, p] : g_peers) {
+                if (p.connecting) continue;
+                if (send_packet(fd, p, PacketType::Text, line)) {
+                    g_db->save_message(p.id, true, line);
+                    ++sent;
+                } else {
+                    dead.push_back(fd);
+                }
+            }
             for (int fd : dead) close_peer(fd);
+            if (sent == 0) printf("[!] немає підключених вузлів, повідомлення нікому не надіслано\n");
         }
     }
 }
@@ -412,7 +457,10 @@ int main(int argc, char* argv[]) {
         else pos.push_back(argv[i]);
     }
 
-    g_id = make_node_id();
+    g_db = std::make_unique<Storage>(g_port);
+    if (g_db->ok()) printf("[*] база історії: %s\n", g_db->path().c_str());
+    // id зберігається в базі, тому не змінюється між запусками
+    g_id = g_db->get_or_set("node_id", make_node_id());
     if (!custom_name.empty()) {
         g_name = custom_name;
     } else {
@@ -473,7 +521,7 @@ int main(int argc, char* argv[]) {
     }
 
     printf("Вузол '%s' (id %s) слухає порт %d.\n", g_name.c_str(), g_id.c_str(), g_port);
-    printf("Команди: /peers — список вузлів, /quit — вихід. Усе інше надсилається всім.\n");
+    printf("Команди: /peers — вузли, /history [ім'я] — історія, /quit — вихід. Усе інше надсилається всім.\n");
     send_beacon();
 
     epoll_event events[32];

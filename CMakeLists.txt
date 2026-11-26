@@ -7,4 +7,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_compile_options(-Wall -Wextra)
 
-add_executable(p2pd src/main.cpp src/protocol/packet.cpp)
+find_package(SQLite3 REQUIRED)
+
+add_executable(p2pd
+    src/main.cpp
+    src/protocol/packet.cpp
+    src/storage/storage.cpp
+)
+target_include_directories(p2pd PRIVATE src)
+target_link_libraries(p2pd PRIVATE SQLite::SQLite3)
