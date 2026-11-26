@@ -17,3 +17,11 @@ add_executable(p2pd
 )
 target_include_directories(p2pd PRIVATE src)
 target_link_libraries(p2pd PRIVATE SQLite::SQLite3)
+
+# Графічний клієнт (потребує Qt 6); якщо Qt немає, збирається лише демон
+find_package(Qt6 COMPONENTS Widgets Network)
+if(Qt6_FOUND)
+    add_subdirectory(gui)
+else()
+    message(WARNING "Qt6 не знайдено: GUI-клієнт не буде зібрано")
+endif()
