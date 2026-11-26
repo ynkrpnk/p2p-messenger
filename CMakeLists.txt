@@ -13,6 +13,7 @@ add_executable(p2pd
     src/main.cpp
     src/protocol/packet.cpp
     src/storage/storage.cpp
+    src/ipc/ipc.cpp
 )
 target_include_directories(p2pd PRIVATE src)
 target_link_libraries(p2pd PRIVATE SQLite::SQLite3)

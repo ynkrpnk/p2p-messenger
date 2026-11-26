@@ -1,3 +1,4 @@
+#include "ipc/ipc.h"
 #include "protocol/packet.h"
 #include "storage/storage.h"
 #include <arpa/inet.h>
@@ -60,6 +61,7 @@ static int g_udp_fd = -1;
 static std::map<int, Peer> g_peers;
 static std::map<std::string, Known> g_known;
 static std::unique_ptr<Storage> g_db;  // локальна база історії
+static IpcServer g_ipc;                // сокет для GUI-клієнта
 
 // ---------- Допоміжні функції ----------
 static void die(const char* msg) {
@@ -122,6 +124,7 @@ static void close_peer(int fd) {
     auto it = g_peers.find(fd);
     if (it == g_peers.end()) return;
     printf("[-] %s відключився\n", label(it->second, fd).c_str());
+    if (!it->second.id.empty()) g_ipc.broadcast({"PEER_DOWN", it->second.id});
     epoll_ctl(g_ep, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
     g_peers.erase(it);
@@ -202,6 +205,7 @@ static void handle_packet(int fd, Peer& p, const Packet& pk) {
             }
             printf("[*] представився: %s\n", p.name.c_str());
             g_db->touch_peer(p.id, p.name);
+            if (!p.id.empty()) g_ipc.broadcast({"PEER_UP", p.id, p.name});
             break;
         }
         case PacketType::Text: {
@@ -209,6 +213,7 @@ static void handle_packet(int fd, Peer& p, const Packet& pk) {
             trim_eol(t);
             printf("[%s] %s\n", label(p, fd).c_str(), t.c_str());
             g_db->save_message(p.id, false, t);
+            g_ipc.broadcast({"MSG", p.id, "0", std::to_string(time(nullptr)), t});
             break;
         }
         case PacketType::Ping:
@@ -373,6 +378,62 @@ static void print_peers() {
                is_known_peer(id) ? "[з'єднано]" : "");
 }
 
+// Надсилає текст вузлу, зберігає в історію і повідомляє GUI
+static bool send_text(int fd, Peer& p, const std::string& text) {
+    if (!send_packet(fd, p, PacketType::Text, text)) return false;
+    g_db->save_message(p.id, true, text);
+    g_ipc.broadcast({"MSG", p.id, "1", std::to_string(time(nullptr)), text});
+    return true;
+}
+
+static int find_peer_fd(const std::string& id) {
+    for (auto& [fd, p] : g_peers)
+        if (!p.connecting && p.id == id) return fd;
+    return -1;
+}
+
+// Привітання для щойно підключеного GUI: хто ми і хто зараз у мережі
+static void on_ipc_connect(int client) {
+    g_ipc.send(client, {"INFO", g_id, g_name});
+    for (auto& [fd, p] : g_peers)
+        if (!p.connecting && !p.id.empty()) g_ipc.send(client, {"PEER_UP", p.id, p.name});
+}
+
+// Команди від GUI:
+//   LIST                    -> PEER <id> <ім'я> <1|0> ..., LISTEND
+//   SEND <id> <текст>       -> (подія MSG) або ERR
+//   HISTORY <id> [кількість]-> HMSG <id> <1|0> <час> <текст> ..., HISTEND <id>
+static void on_ipc_command(int client, const std::vector<std::string>& a) {
+    const std::string& cmd = a[0];
+    if (cmd == "LIST") {
+        std::map<std::string, bool> online;
+        for (auto& [fd, p] : g_peers)
+            if (!p.connecting && !p.id.empty()) {
+                online[p.id] = true;
+                g_ipc.send(client, {"PEER", p.id, p.name, "1"});
+            }
+        for (auto& sp : g_db->peers())
+            if (!online.count(sp.id)) g_ipc.send(client, {"PEER", sp.id, sp.name, "0"});
+        g_ipc.send(client, {"LISTEND"});
+    } else if (cmd == "SEND" && a.size() >= 3) {
+        int fd = find_peer_fd(a[1]);
+        if (fd < 0) {
+            g_ipc.send(client, {"ERR", a[1], "вузол не в мережі"});
+        } else if (!send_text(fd, g_peers[fd], a[2])) {
+            close_peer(fd);
+            g_ipc.send(client, {"ERR", a[1], "помилка відправки"});
+        }
+    } else if (cmd == "HISTORY" && a.size() >= 2) {
+        int limit = a.size() >= 3 ? atoi(a[2].c_str()) : 50;
+        if (limit <= 0 || limit > 500) limit = 50;
+        for (auto& m : g_db->history(a[1], limit))
+            g_ipc.send(client, {"HMSG", a[1], m.outgoing ? "1" : "0", std::to_string(m.ts), m.body});
+        g_ipc.send(client, {"HISTEND", a[1]});
+    } else {
+        g_ipc.send(client, {"ERR", "", "невідома команда: " + cmd});
+    }
+}
+
 static std::string fmt_time(time_t t) {
     char buf[32];
     tm lt;
@@ -406,7 +467,8 @@ static void on_stdin() {
     char buf[1024];
     ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
     if (r <= 0) {
-        g_running = false;
+        // stdin закрито (демон запущено без терміналу): просто не слухаємо його далі
+        epoll_ctl(g_ep, EPOLL_CTL_DEL, STDIN_FILENO, nullptr);
         return;
     }
     std::string text(buf, r);
@@ -428,9 +490,8 @@ static void on_stdin() {
             std::vector<int> dead;
             int sent = 0;
             for (auto& [fd, p] : g_peers) {
-                if (p.connecting) continue;
-                if (send_packet(fd, p, PacketType::Text, line)) {
-                    g_db->save_message(p.id, true, line);
+                if (p.connecting || p.id.empty()) continue;
+                if (send_text(fd, p, line)) {
                     ++sent;
                 } else {
                     dead.push_back(fd);
@@ -491,6 +552,13 @@ int main(int argc, char* argv[]) {
         epoll_ctl(g_ep, EPOLL_CTL_ADD, STDIN_FILENO, &ev);
     }
 
+    g_ipc.on_command = on_ipc_command;
+    g_ipc.on_connect = on_ipc_connect;
+    if (g_ipc.start(g_ep, IpcServer::default_path(g_port)))
+        printf("[*] IPC-сокет для GUI: %s\n", g_ipc.path().c_str());
+    else
+        fprintf(stderr, "[!] не вдалося створити IPC-сокет, GUI не зможе підключитись\n");
+
     // Сигнали через файловий дескриптор: блокуємо звичайну обробку і читаємо з signalfd
     sigset_t mask;
     sigemptyset(&mask);
@@ -545,6 +613,8 @@ int main(int argc, char* argv[]) {
                 }
             } else if (fd == STDIN_FILENO) {
                 on_stdin();
+            } else if (g_ipc.owns(fd)) {
+                g_ipc.handle_event(fd, ev);
             } else if (fd == g_udp_fd) {
                 on_beacon();
             } else if (fd == timer_fd) {
@@ -568,6 +638,7 @@ int main(int argc, char* argv[]) {
 
     // Коректне завершення: закриваємо всі з'єднання та дескриптори
     while (!g_peers.empty()) close_peer(g_peers.begin()->first);
+    g_ipc.stop();
     close(listen_fd);
     close(g_udp_fd);
     close(timer_fd);
