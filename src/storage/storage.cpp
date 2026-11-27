@@ -45,6 +45,7 @@ Storage::Storage(int port) {
         db_ = nullptr;
         return;
     }
+    chmod(path_.c_str(), 0600);  // у базі лежить секретний ключ: доступ лише власнику
     sqlite3_busy_timeout(db_, 2000);
     exec("PRAGMA journal_mode=WAL;");
     exec("PRAGMA synchronous=NORMAL;");

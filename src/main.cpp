@@ -1,3 +1,4 @@
+#include "crypto/crypto.h"
 #include "ipc/ipc.h"
 #include "protocol/packet.h"
 #include "storage/storage.h"
@@ -20,7 +21,6 @@
 #include <ctime>
 #include <map>
 #include <memory>
-#include <random>
 #include <string>
 #include <vector>
 
@@ -38,6 +38,8 @@ struct Peer {
     std::string name;     // ім'я вузла (з Hello)
     std::string inbuf;    // накопичені прийняті байти
     std::string outbuf;   // байти, які ще не вдалося відправити
+    crypto::Session sess;     // захищений канал (готовий після Hello)
+    crypto::Salt my_salt{};   // наша випадкова сіль для цього з'єднання
     bool connecting = false;  // true, поки неблокуючий connect() не завершився
     bool want_out = false;    // чи підписані ми на EPOLLOUT
     time_t last_rx = 0;       // коли востаннє щось отримали
@@ -62,6 +64,7 @@ static std::map<int, Peer> g_peers;
 static std::map<std::string, Known> g_known;
 static std::unique_ptr<Storage> g_db;  // локальна база історії
 static IpcServer g_ipc;                // сокет для GUI-клієнта
+static crypto::KeyPair g_keys;         // довгострокова пара ключів вузла
 
 // ---------- Допоміжні функції ----------
 static void die(const char* msg) {
@@ -78,14 +81,6 @@ static time_t now_sec() {
 static void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) die("fcntl");
-}
-
-static std::string make_node_id() {
-    std::random_device rd;
-    uint64_t v = (static_cast<uint64_t>(rd()) << 32) | rd();
-    char buf[17];
-    snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(v));
-    return buf;
 }
 
 static void trim_eol(std::string& s) {
@@ -124,7 +119,7 @@ static void close_peer(int fd) {
     auto it = g_peers.find(fd);
     if (it == g_peers.end()) return;
     printf("[-] %s відключився\n", label(it->second, fd).c_str());
-    if (!it->second.id.empty()) g_ipc.broadcast({"PEER_DOWN", it->second.id});
+    if (it->second.sess.ready()) g_ipc.broadcast({"PEER_DOWN", it->second.id});
     epoll_ctl(g_ep, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
     g_peers.erase(it);
@@ -159,7 +154,10 @@ static void add_peer(int fd, bool connecting) {
     Peer& p = g_peers[fd];
     p.connecting = connecting;
     p.last_rx = p.last_ping = now_sec();
-    p.outbuf += encode_packet(PacketType::Hello, g_id + "|" + g_name);
+    p.my_salt = crypto::random_salt();
+    // Hello: <публічний ключ hex>|<сіль hex>|<ім'я>
+    p.outbuf += encode_packet(PacketType::Hello,
+                              g_id + "|" + crypto::to_hex(p.my_salt.data(), p.my_salt.size()) + "|" + g_name);
     p.want_out = (wanted_events(p) & EPOLLOUT) != 0;
     epoll_add(fd, wanted_events(p));
 }
@@ -193,35 +191,61 @@ static bool start_connect(const std::string& ip, int port, const std::string& id
     return true;
 }
 
-static void handle_packet(int fd, Peer& p, const Packet& pk) {
+// false = порушення протоколу чи безпеки, з'єднання треба закрити
+static bool handle_packet(int fd, Peer& p, const Packet& pk) {
     switch (pk.type) {
         case PacketType::Hello: {
-            size_t bar = pk.body.find('|');
-            if (bar == std::string::npos) {
-                p.name = pk.body;
-            } else {
-                p.id = pk.body.substr(0, bar);
-                p.name = pk.body.substr(bar + 1);
+            if (p.sess.ready()) return true;  // повторний Hello ігноруємо
+            size_t b1 = pk.body.find('|');
+            size_t b2 = b1 == std::string::npos ? b1 : pk.body.find('|', b1 + 1);
+            if (b2 == std::string::npos) {
+                printf("[!] некоректний Hello\n");
+                return false;
             }
-            printf("[*] представився: %s\n", p.name.c_str());
+            std::string id = pk.body.substr(0, b1);
+            crypto::Key peer_pk;
+            crypto::Salt peer_salt;
+            if (!crypto::from_hex(id, peer_pk.data(), peer_pk.size()) ||
+                !crypto::from_hex(pk.body.substr(b1 + 1, b2 - b1 - 1), peer_salt.data(), peer_salt.size())) {
+                printf("[!] Hello з некоректним ключем\n");
+                return false;
+            }
+            // Ми підключались за id із розсилки: ключ у Hello має збігатися
+            if (!p.id.empty() && p.id != id) {
+                printf("[!] ключ вузла не збігається з очікуваним, з'єднання відхилено\n");
+                return false;
+            }
+            if (!p.sess.setup(g_keys, peer_pk, p.my_salt, peer_salt)) {
+                printf("[!] не вдалося встановити захищений канал\n");
+                return false;
+            }
+            p.id = id;
+            p.name = pk.body.substr(b2 + 1);
+            printf("[*] представився: %s (канал зашифровано)\n", p.name.c_str());
             g_db->touch_peer(p.id, p.name);
-            if (!p.id.empty()) g_ipc.broadcast({"PEER_UP", p.id, p.name});
-            break;
+            g_ipc.broadcast({"PEER_UP", p.id, p.name});
+            return true;
         }
         case PacketType::Text: {
-            std::string t = pk.body;
+            std::string t;
+            if (!p.sess.ready() || !p.sess.open(pk.body, t)) {
+                printf("[!] повідомлення від %s не пройшло перевірку, з'єднання закрито\n",
+                       label(p, fd).c_str());
+                return false;
+            }
             trim_eol(t);
             printf("[%s] %s\n", label(p, fd).c_str(), t.c_str());
             g_db->save_message(p.id, false, t);
             g_ipc.broadcast({"MSG", p.id, "0", std::to_string(time(nullptr)), t});
-            break;
+            return true;
         }
         case PacketType::Ping:
             send_packet(fd, p, PacketType::Pong, "");
-            break;
+            return true;
         case PacketType::Pong:
-            break;  // last_rx уже оновлено
+            return true;  // last_rx уже оновлено
     }
+    return true;
 }
 
 static void on_readable(int fd) {
@@ -248,7 +272,12 @@ static void on_readable(int fd) {
     // Спочатку розбираємо все отримане, і лише потім закриваємо з'єднання
     Packet pk;
     ParseResult res;
-    while ((res = try_decode(p.inbuf, pk)) == ParseResult::Ok) handle_packet(fd, p, pk);
+    while ((res = try_decode(p.inbuf, pk)) == ParseResult::Ok) {
+        if (!handle_packet(fd, p, pk)) {
+            closed = true;
+            break;
+        }
+    }
 
     if (res == ParseResult::Error) {
         printf("[-] помилка протоколу від %s\n", label(p, fd).c_str());
@@ -294,7 +323,7 @@ static void setup_discovery() {
 
 // Формат: P2PM1|<id>|<tcp-порт>|<ім'я>
 static void send_beacon() {
-    std::string msg = "P2PM1|" + g_id + "|" + std::to_string(g_port) + "|" + g_name;
+    std::string msg = "P2PM2|" + g_id + "|" + std::to_string(g_port) + "|" + g_name;
     sockaddr_in a{};
     a.sin_family = AF_INET;
     a.sin_port = htons(DISCOVERY_PORT);
@@ -303,7 +332,7 @@ static void send_beacon() {
 }
 
 static bool parse_beacon(const std::string& s, std::string& id, int& port, std::string& name) {
-    if (s.compare(0, 6, "P2PM1|") != 0) return false;
+    if (s.compare(0, 6, "P2PM2|") != 0) return false;
     size_t b = s.find('|', 6);
     if (b == std::string::npos) return false;
     size_t c = s.find('|', b + 1);
@@ -380,7 +409,8 @@ static void print_peers() {
 
 // Надсилає текст вузлу, зберігає в історію і повідомляє GUI
 static bool send_text(int fd, Peer& p, const std::string& text) {
-    if (!send_packet(fd, p, PacketType::Text, text)) return false;
+    if (!p.sess.ready()) return true;  // викликачі перевіряють готовність каналу
+    if (!send_packet(fd, p, PacketType::Text, p.sess.seal(text))) return false;
     g_db->save_message(p.id, true, text);
     g_ipc.broadcast({"MSG", p.id, "1", std::to_string(time(nullptr)), text});
     return true;
@@ -388,7 +418,7 @@ static bool send_text(int fd, Peer& p, const std::string& text) {
 
 static int find_peer_fd(const std::string& id) {
     for (auto& [fd, p] : g_peers)
-        if (!p.connecting && p.id == id) return fd;
+        if (!p.connecting && p.sess.ready() && p.id == id) return fd;
     return -1;
 }
 
@@ -396,7 +426,7 @@ static int find_peer_fd(const std::string& id) {
 static void on_ipc_connect(int client) {
     g_ipc.send(client, {"INFO", g_id, g_name});
     for (auto& [fd, p] : g_peers)
-        if (!p.connecting && !p.id.empty()) g_ipc.send(client, {"PEER_UP", p.id, p.name});
+        if (!p.connecting && p.sess.ready()) g_ipc.send(client, {"PEER_UP", p.id, p.name});
 }
 
 // Команди від GUI:
@@ -408,7 +438,7 @@ static void on_ipc_command(int client, const std::vector<std::string>& a) {
     if (cmd == "LIST") {
         std::map<std::string, bool> online;
         for (auto& [fd, p] : g_peers)
-            if (!p.connecting && !p.id.empty()) {
+            if (!p.connecting && p.sess.ready()) {
                 online[p.id] = true;
                 g_ipc.send(client, {"PEER", p.id, p.name, "1"});
             }
@@ -490,7 +520,7 @@ static void on_stdin() {
             std::vector<int> dead;
             int sent = 0;
             for (auto& [fd, p] : g_peers) {
-                if (p.connecting || p.id.empty()) continue;
+                if (p.connecting || !p.sess.ready()) continue;
                 if (send_text(fd, p, line)) {
                     ++sent;
                 } else {
@@ -520,8 +550,16 @@ int main(int argc, char* argv[]) {
 
     g_db = std::make_unique<Storage>(g_port);
     if (g_db->ok()) printf("[*] база історії: %s\n", g_db->path().c_str());
-    // id зберігається в базі, тому не змінюється між запусками
-    g_id = g_db->get_or_set("node_id", make_node_id());
+    if (!crypto::init()) die("sodium_init");
+    // Секретний ключ зберігається в базі, тому id вузла не змінюється між запусками.
+    // Публічний ключ завжди виводиться із секретного і слугує ідентифікатором вузла.
+    {
+        crypto::Key sk;
+        std::string stored = g_db->get_or_set("sk", crypto::to_hex(crypto::generate().sk.data(), 32));
+        if (!crypto::from_hex(stored, sk.data(), sk.size())) die("пошкоджений ключ у базі");
+        g_keys = crypto::from_secret(sk);
+        g_id = crypto::to_hex(g_keys.pk.data(), g_keys.pk.size());
+    }
     if (!custom_name.empty()) {
         g_name = custom_name;
     } else {
