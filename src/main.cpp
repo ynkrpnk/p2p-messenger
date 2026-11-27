@@ -1,3 +1,4 @@
+#include "config/config.h"
 #include "crypto/crypto.h"
 #include "ipc/ipc.h"
 #include "protocol/packet.h"
@@ -11,9 +12,11 @@
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -26,9 +29,7 @@
 
 // ---------- Параметри ----------
 constexpr int DISCOVERY_PORT = 45454;  // UDP-порт для виявлення вузлів
-constexpr int BEACON_INTERVAL = 5;     // як часто розсилаємо "я тут" (секунди)
-constexpr int PING_INTERVAL = 5;       // як часто надсилаємо Ping (секунди)
-constexpr int PEER_TIMEOUT = 15;       // скільки чекаємо відповіді до розриву (секунди)
+// Інтервали BEACON/PING/TIMEOUT беруться з конфігурації (g_cfg) і змінюються на льоту
 constexpr int KNOWN_TTL = 20;          // через скільки секунд забуваємо вузол зі списку
 
 // ---------- Дані вузла ----------
@@ -65,11 +66,25 @@ static std::map<std::string, Known> g_known;
 static std::unique_ptr<Storage> g_db;  // локальна база історії
 static IpcServer g_ipc;                // сокет для GUI-клієнта
 static crypto::KeyPair g_keys;         // довгострокова пара ключів вузла
+static Config g_cfg;                   // поточна конфігурація
+static ConfigWatcher g_cfgw;           // inotify-спостерігач за файлом конфігурації
+static std::string g_cfg_path;
+static bool g_name_from_cli = false;   // ім'я задано ключем -n і не береться з файлу
+static std::string g_default_name;
 
 // ---------- Допоміжні функції ----------
 static void die(const char* msg) {
     perror(msg);
     exit(1);
+}
+
+// Запис у системний журнал (syslog). Вміст повідомлень сюди не потрапляє.
+static void slog(int prio, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+static void slog(int prio, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsyslog(prio, fmt, ap);
+    va_end(ap);
 }
 
 static time_t now_sec() {
@@ -119,6 +134,7 @@ static void close_peer(int fd) {
     auto it = g_peers.find(fd);
     if (it == g_peers.end()) return;
     printf("[-] %s відключився\n", label(it->second, fd).c_str());
+    slog(LOG_INFO, "вузол '%s' відключився", label(it->second, fd).c_str());
     if (it->second.sess.ready()) g_ipc.broadcast({"PEER_DOWN", it->second.id});
     epoll_ctl(g_ep, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
@@ -200,6 +216,7 @@ static bool handle_packet(int fd, Peer& p, const Packet& pk) {
             size_t b2 = b1 == std::string::npos ? b1 : pk.body.find('|', b1 + 1);
             if (b2 == std::string::npos) {
                 printf("[!] некоректний Hello\n");
+                slog(LOG_WARNING, "отримано некоректний Hello, з'єднання відхилено");
                 return false;
             }
             std::string id = pk.body.substr(0, b1);
@@ -208,11 +225,13 @@ static bool handle_packet(int fd, Peer& p, const Packet& pk) {
             if (!crypto::from_hex(id, peer_pk.data(), peer_pk.size()) ||
                 !crypto::from_hex(pk.body.substr(b1 + 1, b2 - b1 - 1), peer_salt.data(), peer_salt.size())) {
                 printf("[!] Hello з некоректним ключем\n");
+                slog(LOG_WARNING, "Hello з некоректним ключем, з'єднання відхилено");
                 return false;
             }
             // Ми підключались за id із розсилки: ключ у Hello має збігатися
             if (!p.id.empty() && p.id != id) {
                 printf("[!] ключ вузла не збігається з очікуваним, з'єднання відхилено\n");
+                slog(LOG_WARNING, "ключ вузла не збігається з очікуваним (можлива підміна), з'єднання відхилено");
                 return false;
             }
             if (!p.sess.setup(g_keys, peer_pk, p.my_salt, peer_salt)) {
@@ -222,6 +241,7 @@ static bool handle_packet(int fd, Peer& p, const Packet& pk) {
             p.id = id;
             p.name = pk.body.substr(b2 + 1);
             printf("[*] представився: %s (канал зашифровано)\n", p.name.c_str());
+            slog(LOG_INFO, "вузол '%s' (%.8s) підключено, канал зашифровано", p.name.c_str(), p.id.c_str());
             g_db->touch_peer(p.id, p.name);
             g_ipc.broadcast({"PEER_UP", p.id, p.name});
             return true;
@@ -231,6 +251,8 @@ static bool handle_packet(int fd, Peer& p, const Packet& pk) {
             if (!p.sess.ready() || !p.sess.open(pk.body, t)) {
                 printf("[!] повідомлення від %s не пройшло перевірку, з'єднання закрито\n",
                        label(p, fd).c_str());
+                slog(LOG_WARNING, "повідомлення від '%s' не пройшло перевірку автентичності, з'єднання закрито",
+                     label(p, fd).c_str());
                 return false;
             }
             trim_eol(t);
@@ -281,6 +303,7 @@ static void on_readable(int fd) {
 
     if (res == ParseResult::Error) {
         printf("[-] помилка протоколу від %s\n", label(p, fd).c_str());
+        slog(LOG_WARNING, "помилка протоколу від '%s'", label(p, fd).c_str());
         closed = true;
     }
     if (closed) close_peer(fd);
@@ -377,13 +400,14 @@ static void on_timer(int tfd) {
     time_t now = now_sec();
     ++g_tick;
 
-    if (g_tick % BEACON_INTERVAL == 0) send_beacon();
+    if (g_tick % g_cfg.beacon_interval == 0) send_beacon();
 
     std::vector<int> dead;
     for (auto& [fd, p] : g_peers) {
-        if (now - p.last_rx > PEER_TIMEOUT) {
+        if (now - p.last_rx > g_cfg.peer_timeout) {
+            slog(LOG_NOTICE, "тайм-аут вузла '%s' (мовчить понад %d с)", label(p, fd).c_str(), g_cfg.peer_timeout);
             dead.push_back(fd);
-        } else if (!p.connecting && now - p.last_ping >= PING_INTERVAL) {
+        } else if (!p.connecting && now - p.last_ping >= g_cfg.ping_interval) {
             p.last_ping = now;
             if (!send_packet(fd, p, PacketType::Ping, "")) dead.push_back(fd);
         }
@@ -533,8 +557,36 @@ static void on_stdin() {
     }
 }
 
+// ---------- Конфігурація ----------
+// Читає файл і застосовує значення. Некоректний файл ігнорується, діють попередні налаштування.
+static void apply_config(bool initial) {
+    Config c;
+    std::string err;
+    if (!load_config(g_cfg_path, c, err)) {
+        printf("[!] конфігурацію не застосовано: %s\n", err.c_str());
+        slog(LOG_WARNING, "конфігурацію не застосовано: %s", err.c_str());
+        return;
+    }
+    g_cfg = c;
+    if (!g_name_from_cli) {
+        std::string n = c.name.empty() ? g_default_name : c.name;
+        if (n != g_name) {
+            g_name = n;
+            g_ipc.broadcast({"INFO", g_id, g_name});  // GUI оновить заголовок
+        }
+    }
+    if (!initial) {
+        printf("[*] конфігурацію перечитано (ім'я '%s', ping %d с, тайм-аут %d с, розсилка %d с)\n",
+               g_name.c_str(), c.ping_interval, c.peer_timeout, c.beacon_interval);
+        slog(LOG_INFO, "конфігурацію перечитано: ім'я '%s', ping %d, timeout %d, beacon %d",
+             g_name.c_str(), c.ping_interval, c.peer_timeout, c.beacon_interval);
+    }
+}
+
 // ---------- Точка входу ----------
 int main(int argc, char* argv[]) {
+    setvbuf(stdout, nullptr, _IOLBF, 0);  // рядковий буфер: журнал одразу видно і під systemd
+    openlog("p2pd", LOG_PID | LOG_NDELAY, LOG_DAEMON);
     if (argc < 2) {
         fprintf(stderr, "Використання: %s <порт> [ip порт_пира] [-n ім'я]\n", argv[0]);
         return 1;
@@ -560,12 +612,12 @@ int main(int argc, char* argv[]) {
         g_keys = crypto::from_secret(sk);
         g_id = crypto::to_hex(g_keys.pk.data(), g_keys.pk.size());
     }
-    if (!custom_name.empty()) {
-        g_name = custom_name;
-    } else {
+    {
         passwd* pw = getpwuid(getuid());
-        g_name = std::string(pw ? pw->pw_name : "user") + ":" + std::to_string(g_port);
+        g_default_name = std::string(pw ? pw->pw_name : "user") + ":" + std::to_string(g_port);
     }
+    g_name_from_cli = !custom_name.empty();
+    g_name = g_name_from_cli ? custom_name : g_default_name;
 
     // TCP: слухаючий сокет
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -597,6 +649,15 @@ int main(int argc, char* argv[]) {
     else
         fprintf(stderr, "[!] не вдалося створити IPC-сокет, GUI не зможе підключитись\n");
 
+    // Конфігурація: читаємо файл і стежимо за ним через inotify
+    g_cfg_path = config_path(g_port);
+    ensure_default_config(g_cfg_path);
+    apply_config(true);
+    if (g_cfgw.start(g_ep, g_cfg_path))
+        printf("[*] конфігурація: %s (зміни застосовуються автоматично)\n", g_cfg_path.c_str());
+    else
+        fprintf(stderr, "[!] не вдалося стежити за конфігурацією\n");
+
     // Сигнали через файловий дескриптор: блокуємо звичайну обробку і читаємо з signalfd
     sigset_t mask;
     sigemptyset(&mask);
@@ -627,6 +688,7 @@ int main(int argc, char* argv[]) {
     }
 
     printf("Вузол '%s' (id %s) слухає порт %d.\n", g_name.c_str(), g_id.c_str(), g_port);
+    slog(LOG_INFO, "запуск: порт %d, ім'я '%s', id %.8s", g_port, g_name.c_str(), g_id.c_str());
     printf("Команди: /peers — вузли, /history [ім'я] — історія, /quit — вихід. Усе інше надсилається всім.\n");
     send_beacon();
 
@@ -651,6 +713,8 @@ int main(int argc, char* argv[]) {
                 }
             } else if (fd == STDIN_FILENO) {
                 on_stdin();
+            } else if (fd == g_cfgw.fd()) {
+                if (g_cfgw.handle_event()) apply_config(false);
             } else if (g_ipc.owns(fd)) {
                 g_ipc.handle_event(fd, ev);
             } else if (fd == g_udp_fd) {
@@ -661,6 +725,7 @@ int main(int argc, char* argv[]) {
                 signalfd_siginfo si;
                 if (read(sig_fd, &si, sizeof(si)) > 0) {
                     printf("\n[!] отримано сигнал %u, завершення роботи...\n", si.ssi_signo);
+                    slog(LOG_INFO, "отримано сигнал %u, завершення роботи", si.ssi_signo);
                     g_running = false;
                 }
             } else {
@@ -683,5 +748,7 @@ int main(int argc, char* argv[]) {
     close(sig_fd);
     close(g_ep);
     printf("Вузол зупинено.\n");
+    slog(LOG_INFO, "вузол зупинено");
+    closelog();
     return 0;
 }

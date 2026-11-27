@@ -1,0 +1,13 @@
+# Користувацька служба systemd. Параметр після @ — порт вузла.
+# Встановлення: див. README або інструкцію у пояснювальній записці.
+[Unit]
+Description=P2P-месенджер, демон (порт %i)
+
+[Service]
+Type=simple
+ExecStart=%h/p2p-messenger/build/p2pd %i
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

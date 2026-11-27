@@ -15,6 +15,7 @@ find_library(SODIUM_LIBRARY sodium REQUIRED)
 add_library(p2pcore STATIC
     src/protocol/packet.cpp
     src/crypto/crypto.cpp
+    src/config/config.cpp
 )
 target_include_directories(p2pcore PUBLIC src ${SODIUM_INCLUDE_DIR})
 target_link_libraries(p2pcore PUBLIC ${SODIUM_LIBRARY})

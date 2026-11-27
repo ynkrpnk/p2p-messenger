@@ -2,6 +2,11 @@
 #include <cstdio>
 #include <string>
 
+#include <cstdlib>
+#include <fstream>
+#include <unistd.h>
+
+#include "config/config.h"
 #include "crypto/crypto.h"
 #include "protocol/packet.h"
 
@@ -109,6 +114,30 @@ static void test_hex() {
     CHECK(!crypto::from_hex("zz", back.data(), back.size()));
 }
 
+static bool write_and_load(const std::string& text, Config& c, std::string& err) {
+    char path[] = "/tmp/p2pm-test-XXXXXX";
+    int fd = mkstemp(path);
+    close(fd);
+    { std::ofstream(path) << text; }
+    bool ok = load_config(path, c, err);
+    unlink(path);
+    return ok;
+}
+
+static void test_config() {
+    printf("config: розбір і перевірка файлу\n");
+    Config c;
+    std::string err;
+    CHECK(write_and_load("# коментар\nname = Аліса\nping_interval=2\npeer_timeout=10\nbeacon_interval=3\n", c, err));
+    CHECK(c.name == "Аліса" && c.ping_interval == 2 && c.peer_timeout == 10 && c.beacon_interval == 3);
+    CHECK(!write_and_load("ping_interval=abc\n", c, err));        // не число
+    CHECK(!write_and_load("ping_interval=0\n", c, err));          // поза діапазоном
+    CHECK(!write_and_load("something=1\n", c, err));              // невідомий ключ
+    CHECK(!write_and_load("ping_interval=10\npeer_timeout=12\n", c, err));  // timeout < 2*ping
+    CHECK(!write_and_load("name=a|b\n", c, err));                 // заборонений символ
+    CHECK(write_and_load("", c, err) && c.ping_interval == 5);     // порожній файл = типові значення
+}
+
 int main() {
     if (!crypto::init()) { printf("sodium_init не вдалося\n"); return 2; }
     test_packet_roundtrip();
@@ -118,6 +147,7 @@ int main() {
     test_crypto_tamper_replay();
     test_crypto_sessions_independent();
     test_hex();
+    test_config();
     printf(g_failed ? "\nПРОВАЛЕНО перевірок: %d\n" : "\nУсі тести пройдено\n", g_failed);
     return g_failed ? 1 : 0;
 }
