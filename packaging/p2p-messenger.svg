@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#0ea5e9"/>
+    </linearGradient>
+  </defs>
+  <!-- фон -->
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
+  <!-- хмаринка повідомлення -->
+  <path d="M128 52c-44 0-80 29-80 66 0 21 12 39 30 51l-8 32 38-20c7 2 13 3 20 3 44 0 80-29 80-66s-36-66-80-66z" fill="#ffffff"/>
+  <!-- три вузли P2P і зв'язки між ними -->
+  <g stroke="#2563eb" stroke-width="7" stroke-linecap="round" fill="none">
+    <line x1="128" y1="86" x2="94" y2="134"/>
+    <line x1="128" y1="86" x2="162" y2="134"/>
+    <line x1="94" y1="134" x2="162" y2="134"/>
+  </g>
+  <g fill="#2563eb">
+    <circle cx="128" cy="86" r="14"/>
+    <circle cx="94" cy="134" r="14"/>
+    <circle cx="162" cy="134" r="14"/>
+  </g>
+</svg>
